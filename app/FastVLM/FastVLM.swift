@@ -103,7 +103,9 @@ private enum Language {
         }
 
         public func callAsFunction(
-            _ x: MLXArray, mask: MLXArray? = nil, cache: KVCache?
+            _ x: MLXArray,
+            mask: MLXFast.ScaledDotProductAttentionMaskMode = .none,
+            cache: KVCache?
         ) -> MLXArray {
             let (B, L) = (x.dim(0), x.dim(1))
 
@@ -117,17 +119,24 @@ private enum Language {
             values = values.reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
 
             let offset = cache?.offset ?? 0
-            let mask = mask?[0..., 0 ..< keys.dim(-2)]
 
             queries = rotaryEmbedding(queries, offset: offset)
             keys = rotaryEmbedding(keys, offset: offset)
 
-            if let cache {
-                (keys, values) = cache.update(keys: keys, values: values)
+            let attentionMask: MLXFast.ScaledDotProductAttentionMaskMode
+            if case .array(let maskArray) = mask {
+                attentionMask = .array(maskArray[.ellipsis, 0 ..< keys.dim(-2)])
+            } else {
+                attentionMask = mask
             }
 
-            let output = MLXFast.scaledDotProductAttention(
-                queries: queries, keys: keys, values: values, scale: scale, mask: mask
+            let output = attentionWithCacheUpdate(
+                queries: queries,
+                keys: keys,
+                values: values,
+                cache: cache,
+                scale: scale,
+                mask: attentionMask
             )
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, -1)
@@ -171,7 +180,9 @@ private enum Language {
         }
 
         public func callAsFunction(
-            _ x: MLXArray, mask: MLXArray? = nil, cache: KVCache?
+            _ x: MLXArray,
+            mask: MLXFast.ScaledDotProductAttentionMaskMode = .none,
+            cache: KVCache?
         ) -> MLXArray {
             var r = attention(inputLayerNorm(x), mask: mask, cache: cache)
             let h = x + r
@@ -260,21 +271,26 @@ private enum Vision {
     fileprivate class VisionModelCoreML {
 
         let lock = NSLock()
-        var _model: fastvithd?
+        var _model: MLModel?
 
         init() {
         }
 
-        func load() throws -> fastvithd {
+        func load() throws -> MLModel {
             try lock.withLock {
                 if let model = _model { return model }
-                let model = try fastvithd()
+                let bundle = Bundle(for: FastVLM.self)
+                guard let url = bundle.url(forResource: "fastvithd", withExtension: "mlpackage") else {
+                    fatalError("Unable to locate fastvithd.mlpackage in bundle resources")
+                }
+                let configuration = MLModelConfiguration()
+                let model = try MLModel(contentsOf: url, configuration: configuration)
                 _model = model
                 return model
             }
         }
 
-        public func model() -> fastvithd {
+        public func model() -> MLModel {
             try! load()
         }
 
@@ -299,12 +315,22 @@ private enum Vision {
                     strides: strides.map { .init(value: $0) })
 
                 // inference
-                let output = try! model().prediction(images: array)
-                precondition(output.image_features.shape == [1, 256, 3072])
-                precondition(output.image_features.dataType == .float32)
-                return output.image_features.withUnsafeBytes { ptr in
-                    MLXArray(ptr, [1, 256, 3072], type: Float32.self)
+                let inputFeatures = try! MLDictionaryFeatureProvider(
+                    dictionary: ["images": MLFeatureValue(multiArray: array)]
+                )
+                let output = try! model().prediction(from: inputFeatures)
+                guard let imageFeatures = output.featureValue(for: "image_features")?.multiArrayValue
+                else {
+                    fatalError("Model output missing image_features")
                 }
+                precondition(imageFeatures.shape.map { $0.intValue } == [1, 256, 3072])
+                precondition(imageFeatures.dataType == .float32)
+                let count = imageFeatures.count
+                let pointer = imageFeatures.dataPointer.bindMemory(to: Float32.self, capacity: count)
+                let data = Data(
+                    bytes: UnsafePointer(pointer),
+                    count: count * MemoryLayout<Float32>.size)
+                return MLXArray(data, [1, 256, 3072], type: Float32.self)
             }
         }
     }
@@ -315,7 +341,7 @@ private enum Vision {
 
         public override init() {}
 
-        public func callAsFunction(_ hiddenStates: MLXArray, gridThw: [THW]) -> MLXArray {
+        public func callAsFunction(_ hiddenStates: MLXArray, frames: [THW]? = nil) -> MLXArray {
             model.encode(hiddenStates)
         }
     }
@@ -331,11 +357,13 @@ public class FastVLMProcessor: UserInputProcessor {
     private let config: FastVLMProcessorConfiguration
     private let imageProcessingConfig: FastVLMPreProcessorConfiguration
     private let tokenizer: any Tokenizer
+    private let messageGenerator: any MessageGenerator
 
     public init(_ config: FastVLMPreProcessorConfiguration, tokenizer: any Tokenizer) {
         self.config = FastVLMProcessorConfiguration()
         self.imageProcessingConfig = config
         self.tokenizer = tokenizer
+        self.messageGenerator = DefaultMessageGenerator()
     }
 
     public func preprocess(image: CIImage, processing: UserInput.Processing?) throws -> (
@@ -361,13 +389,28 @@ public class FastVLMProcessor: UserInputProcessor {
     }
 
     public func prepare(prompt: UserInput.Prompt, imageTHW: THW?) -> String {
-        var messages = prompt.asMessages()
-        if messages[0]["role"] != "system" {
-            messages.insert(["role": "system", "content": "You are a helpful assistant."], at: 0)
+        let messages: [Message] =
+            switch prompt {
+            case .messages(let existing):
+                existing
+            default:
+                messageGenerator.generate(from: UserInput(prompt: prompt))
+            }
+
+        var mutableMessages = messages
+        if mutableMessages.isEmpty {
+            mutableMessages = [
+                ["role": "system", "content": "You are a helpful assistant."]
+            ]
         }
 
-        let lastIndex = messages.count - 1
-        var lastMessage = messages[lastIndex]["content"] ?? ""
+        if mutableMessages[0]["role"] as? String != "system" {
+            mutableMessages.insert(
+                ["role": "system", "content": "You are a helpful assistant."], at: 0)
+        }
+
+        let lastIndex = mutableMessages.count - 1
+        var lastMessage = mutableMessages[lastIndex]["content"] as? String ?? ""
 
         // processing_llava.py
         if let imageTHW {
@@ -386,12 +429,14 @@ public class FastVLMProcessor: UserInputProcessor {
                 .joined()
         }
 
-        messages[lastIndex]["content"] = lastMessage
+        mutableMessages[lastIndex]["content"] = lastMessage
 
         return
-            messages
+            mutableMessages
             .map {
-                "<|im_start|>\($0["role"] ?? "user")\n\($0["content"] ?? "")<|im_end|>"
+                let role = $0["role"] as? String ?? "user"
+                let content = $0["content"] as? String ?? ""
+                return "<|im_start|>\(role)\n\(content)<|im_end|>"
             }
             .joined(separator: "\n")
             + "\n<|im_start|>assistant\n"
@@ -411,7 +456,7 @@ public class FastVLMProcessor: UserInputProcessor {
 
         let (pixels, thw) = try preprocess(
             image: input.images[0].asCIImage(), processing: input.processing)
-        let image = LMInput.ProcessedImage(pixels: pixels, imageGridThw: [thw])
+        let image = LMInput.ProcessedImage(pixels: pixels, frames: [thw])
 
         let prompt = prepare(prompt: input.prompt, imageTHW: thw)
         let promptTokens = tokenizer.encode(text: prompt)
@@ -457,11 +502,15 @@ private class FastVLMMultiModalProjector: Module, UnaryLayer {
 public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
 
     static public var modelConfiguration: ModelConfiguration {
-        let bundle = Bundle(for: FastVLM.self)
-        let url = bundle.url(forResource: "config", withExtension: "json")!
-            .resolvingSymlinksInPath()
-            .deletingLastPathComponent()
-        return ModelConfiguration(directory: url)
+        // Use the application support directory for model storage
+        let fileManager = FileManager.default
+        let appSupportURL = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let modelDirectory = appSupportURL.appendingPathComponent("FastVLM", isDirectory: true)
+        
+        // Create the directory if it doesn't exist
+        try? fileManager.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
+        
+        return ModelConfiguration(directory: modelDirectory)
     }
 
     static public func register(modelFactory: VLMModelFactory) {
@@ -499,10 +548,10 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
         self._multiModalProjector.wrappedValue = FastVLMMultiModalProjector(config)
     }
 
-    private func inputEmbeddings(inputIds: MLXArray, pixelValues: MLXArray?, gridThw: [THW]?)
+    private func inputEmbeddings(inputIds: MLXArray, pixelValues: MLXArray?, frames: [THW]?)
         -> MLXArray
     {
-        guard let pixelValues, let gridThw else {
+        guard let pixelValues, let frames else {
             return languageModel(inputIds).logits
         }
 
@@ -510,7 +559,7 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
         let inputEmbeds = languageModel.model.embedTokens(inputIds)
 
         // Get the ouptut hidden states from the vision model
-        let imageFeaturesCoreML = self.visionModel(pixelValues, gridThw: gridThw)
+        let imageFeaturesCoreML = self.visionModel(pixelValues, frames: frames)
         let imageFeatures = multiModalProjector(imageFeaturesCoreML)
 
         // Insert special image tokens in the input_ids
@@ -537,13 +586,13 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
     public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
-        let gridThw = input.image?.imageGridThw
+        let frames = input.image?.frames
 
         let dtype = DType.float32
         let pixels = input.image?.pixels.asType(dtype)
 
         let inputEmbeddings = self.inputEmbeddings(
-            inputIds: input.text.tokens, pixelValues: pixels, gridThw: gridThw)
+            inputIds: input.text.tokens, pixelValues: pixels, frames: frames)
 
         let result = languageModel(nil, cache: cache, inputEmbedding: inputEmbeddings)
 
